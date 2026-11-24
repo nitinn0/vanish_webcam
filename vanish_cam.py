@@ -104,6 +104,8 @@ MODEL_URLS = {
 
 CALIBRATION_SECONDS = 4.0
 BACKGROUND_SAMPLE_SECONDS = 0.55
+# A frame is the empty room only when almost no pixels belong to a person.
+EMPTY_FRAME_COVERAGE = 0.02
 VANISH_SECONDS = 3.6
 GESTURE_INTERVAL_SECONDS = 0.14
 
@@ -405,17 +407,26 @@ def download_models(mode: str = "normal") -> None:
 
 
 def open_camera(index: int, width: int, height: int) -> cv2.VideoCapture:
-    if platform.system() == "Windows":
+    system = platform.system()
+    if system == "Windows":
         capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if not capture.isOpened():
             capture.release()
             capture = cv2.VideoCapture(index)
+    elif system == "Darwin":
+        capture = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
     else:
         capture = cv2.VideoCapture(index)
 
     if not capture.isOpened():
+        hint = ""
+        if system == "Darwin":
+            hint = (
+                " On this Mac, allow Camera access for Terminal in "
+                "System Settings → Privacy & Security → Camera, then run it again."
+            )
         raise RuntimeError(
-            f"Webcam {index} non disponibile. Chiudi le altre app oppure prova --camera 1."
+            f"Webcam {index} non disponibile. Chiudi le altre app oppure prova --camera 1.{hint}"
         )
 
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -543,6 +554,25 @@ def make_dissolve_fields(height: int, width: int) -> tuple[np.ndarray, np.ndarra
         + np.sin(x_normal * 18.0) * 0.025
     )
     return np.clip(field, 0.0, 1.0), fine_noise
+
+
+def person_coverage(mask: np.ndarray) -> float:
+    return float(np.mean(mask > 0.45))
+
+
+def calibration_preview(frame: np.ndarray, occupied: bool) -> np.ndarray:
+    """Local hint only. The meeting feed stays free of this text."""
+    preview = frame.copy()
+    text = "STEP OUT OF THE FRAME" if occupied else "HOLD STILL"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(frame.shape[1], 1) / 1100
+    thickness = max(2, int(round(scale * 2)))
+    (width, height), _ = cv2.getTextSize(text, font, scale, thickness)
+    x = max(16, (frame.shape[1] - width) // 2)
+    y = max(height + 16, int(frame.shape[0] * 0.12))
+    cv2.putText(preview, text, (x, y), font, scale, (20, 20, 20), thickness + 2, cv2.LINE_AA)
+    cv2.putText(preview, text, (x, y), font, scale, (245, 245, 245), thickness, cv2.LINE_AA)
+    return preview
 
 
 def person_mask(
@@ -963,8 +993,10 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str, licens
     virtual_camera_initialized = False
     calibration_remaining = None
     last_gesture_report = 0.0
+    room_clear_since: float | None = None
+    last_occupied_report = 0.0
     started = time.perf_counter()
-    print("[Webcam] Esci dall'inquadratura per 4 secondi: acquisisco lo sfondo.")
+    print("[Webcam] Step out of the frame. The background is saved only when the room is empty.")
     if mode == "goku":
         print(f"[Webcam] Goku: due dita unite alla fronte per {goku_delay:g} secondi per sparire o riapparire. "
               "Rilascia la posa prima di ripetere il gesto.")
@@ -1060,22 +1092,29 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str, licens
                     goku_countdown_remaining = None
 
             if state.phase == "calibrating":
-                elapsed = now - state.calibration_started
-                remaining = max(0, int(np.ceil(CALIBRATION_SECONDS - elapsed)))
-                if remaining != calibration_remaining:
-                    print(f"[Webcam] Acquisizione sfondo: {remaining} secondi.")
-                    calibration_remaining = remaining
-                if elapsed >= CALIBRATION_SECONDS - BACKGROUND_SAMPLE_SECONDS:
+                rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                mask = person_mask(segmenter, mp_image, elapsed_ms, width, height)
+                occupied = person_coverage(mask) > EMPTY_FRAME_COVERAGE
+                if occupied:
+                    background_samples.clear()
+                    room_clear_since = None
+                    if now - last_occupied_report >= 1.0:
+                        print("[Webcam] You are still in frame. Step out completely, then hold still.")
+                        last_occupied_report = now
+                else:
+                    if room_clear_since is None:
+                        room_clear_since = now
+                        background_samples.clear()
+                        print("[Webcam] Room is clear. Hold still.")
                     background_samples.append(camera_frame.copy())
-                if elapsed >= CALIBRATION_SECONDS:
-                    if background_samples:
+                    if now - room_clear_since >= BACKGROUND_SAMPLE_SECONDS and background_samples:
                         stack = np.stack(background_samples[-18:], axis=0)
                         background = np.median(stack, axis=0).astype(np.uint8)
-                    else:
-                        background = camera_frame.copy()
-                    background_samples.clear()
-                    state.phase = "ready"
-                    print("[Webcam] Sfondo pronto. Puoi rientrare nell'inquadratura.")
+                        background_samples.clear()
+                        room_clear_since = None
+                        state.phase = "ready"
+                        print("[Webcam] Background ready. Come back, then make the gesture to vanish.")
                 display = camera_frame
 
             elif background is None:
@@ -1190,9 +1229,10 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str, licens
 
             if license_session is not None:
                 license_session.ensure_valid()
+            preview = calibration_preview(display, occupied) if state.phase == "calibrating" else display
             if virtual_camera is not None:
                 send_virtual_frame(virtual_camera, display)
-            cv2.imshow(WINDOW_NAME, display)
+            cv2.imshow(WINDOW_NAME, preview)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), 27):
@@ -1215,7 +1255,9 @@ def run_camera(args: argparse.Namespace, resources: ExitStack, mode: str, licens
                     goku_countdown_remaining = None
                 background_samples.clear()
                 calibration_remaining = None
-                print("[Webcam] Esci dall'inquadratura per 4 secondi: acquisisco il nuovo sfondo.")
+                room_clear_since = None
+                last_occupied_report = 0.0
+                print("[Webcam] Step out of the frame so the empty room can be captured again.")
             elif key == ord("r"):
                 if background is not None and mode == "itachi" and state.phase == "vanished":
                     rgb = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
